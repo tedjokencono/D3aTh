@@ -642,12 +642,11 @@
         var ms = expiryMs(t.raw);
         if (ms === null) return;
         el.textContent = ms <= 0 ? "⚠ EXPIRED" : "sisa " + fmtDur(ms);
-      } else if (t.kind === "claim") {
-        el.textContent = fmtHMS(msUntilWIB(t.hh, t.mm));
       } else {
         el.textContent = fmtDur(msUntilWIB(t.hh, t.mm));
       }
     });
+    refreshClaimCountdown();
     tickSnapAge();
   }
   function tickSnapAge(){
@@ -838,23 +837,49 @@
     requestAnimationFrame(function(){ term.scrollTop = term.scrollHeight; });
   }
 
-  function renderClaim(data){
+  /* Next Claim: pilih event TERDEKAT yang masih di masa depan.
+     Event yang sudah lewat (ms <= 0) dilewati — kalau tidak, kartu
+     mengunci ke event yang baru lewat dan countdown-nya mentok di
+     00:00:00 sampai data baru datang (padahal event berikutnya sudah
+     ada). Dipakai renderClaim + refreshClaimCountdown (tiap detik). */
+  function pickNextClaim(data){
     var best = null;
+    if (!data || !Array.isArray(data.acc)) return null;
     data.acc.forEach(function(a){
       var nx = parseNext(a.n);
       if (!nx || nx.hh === null) return;
       var ms = msUntilWIB(nx.hh, nx.mm);
+      if (ms <= 0) return; /* sudah lewat, jangan jadi 'best' */
       if (!best || ms < best.ms) best = { a:a, nx:nx, ms:ms };
     });
+    return best;
+  }
+  function renderClaim(data){
+    var best = pickNextClaim(data);
     var card = $("claimCard");
     if (!best) { card.classList.add("hidden"); return; }
     card.classList.remove("hidden");
     $("claimAcc").textContent = best.a.l || "—";
     $("claimEv").textContent = best.nx.label || best.a.n || "—";
-    var cdEl = $("claimCd");
-    cdEl.setAttribute("data-cd", "claim");
-    cdEl.textContent = fmtHMS(best.ms);
-    cdTargets.push({ key:"claim", kind:"claim", hh:best.nx.hh, mm:best.nx.mm });
+    $("claimCd").textContent = fmtHMS(best.ms);
+  }
+  /* Dipanggil tiap detik dari tickCountdowns: hitung ulang event
+     terdekat dari data yang ada, jadi begitu satu event lewat, kartu
+     langsung pindah ke event berikutnya tanpa nunggu fetch/refresh. */
+  function refreshClaimCountdown(){
+    var card = $("claimCard");
+    if (!card || card.classList.contains("hidden")) {
+      /* kartu sedang hidden (renderClaim tidak menemukan event) — coba
+         tampilkan lagi kalau sekarang ada event masa depan */
+      var b0 = pickNextClaim(state.data);
+      if (!b0) return;
+      card.classList.remove("hidden");
+    }
+    var best = pickNextClaim(state.data);
+    if (!best) return;
+    $("claimAcc").textContent = best.a.l || "—";
+    $("claimEv").textContent = best.nx.label || best.a.n || "—";
+    $("claimCd").textContent = fmtHMS(best.ms);
   }
 
   function renderBoss(data){
