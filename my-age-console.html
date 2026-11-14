@@ -563,7 +563,18 @@
     var w = wibNow();
     var target = Date.UTC(w.getUTCFullYear(), w.getUTCMonth(), w.getUTCDate(), hh, mm, 0);
     var diff = target - w.getTime();
-    if (diff < -30*1000) diff += 24*3600*1000;
+    if (diff < -30*1000) {
+      /* Event sudah lewat. Kalau baru lewat (< 30 menit), itu event
+         yang baru jatuh tempo (bot sedang memproses / snapshot basi
+         karena cache CDN) — jangan rollover ke besok, kembalikan 0
+         ("sekarang"). Kalau tidak, countdown detail akun menampilkan
+         ~24 jam untuk event yang sudah lewat, dan kartu Next Claim
+         memilih event basi itu sebagai "best" (~24 jam). Kalau sudah
+         lewat > 30 menit, itu event besok (mis. Daily 07:00 saat ini
+         08:00) — rollover 24 jam seperti biasa. */
+      if (diff > -30*60*1000) return 0;
+      diff += 24*3600*1000;
+    }
     return diff;
   }
   function expiryMs(e){
@@ -575,8 +586,18 @@
     var w = wibNow();
     var year = w.getUTCFullYear();
     var day = parseInt(m[1],10), hh = parseInt(m[3],10), mm = parseInt(m[4],10);
+    /* Expiry TMA adalah datetime satu-kali (auth_date + 24 jam), bukan
+       tanggal tahunan berulang — jadi JANGAN rollover tahun secara
+       umum. TMA yang mati berbulan-bulan lalu harus tampil expired,
+       bukan "belum expired" (bug lama: rollover 180 hari membuat
+       "1 Jan" dari 14 Nov dianggap +48 hari). Satu-satunya pengecualian
+       adalah batas tahun: sekarang Desember dan expiry Januari — itu
+       Januari TAHUN DEPAN (tma baru, expiry besok/lusa), bukan Januari
+       tahun ini. */
     var diff = Date.UTC(year, mon, day, hh, mm, 0) - w.getTime();
-    if (diff < -180*24*3600*1000) diff = Date.UTC(year+1, mon, day, hh, mm, 0) - w.getTime();
+    if (diff < -180*24*3600*1000 && mon === 0 && w.getUTCMonth() === 11) {
+      diff = Date.UTC(year+1, mon, day, hh, mm, 0) - w.getTime();
+    }
     return diff;
   }
   function parseVault(v){
@@ -696,6 +717,12 @@
   function render(){
     var data = state.data;
     if (!validSnapshot(data)) { showEmpty(); return; }
+    /* Satu entry acc yang null/malformed membuat render() throw di
+       tengah jalan (DOM setengah ter-render) dan fetch berikutnya
+       di-dedupe — halaman tetap rusak sampai data berubah. Buang
+       entry non-objek di sini supaya satu entry rusak tidak merusak
+       semua akun. */
+    data.acc = data.acc.filter(function(a){ return a && typeof a === "object"; });
     $("emptyState").classList.add("hidden");
     $("main").classList.remove("hidden");
     $("tabbar").classList.remove("hidden");
@@ -868,15 +895,15 @@
      langsung pindah ke event berikutnya tanpa nunggu fetch/refresh. */
   function refreshClaimCountdown(){
     var card = $("claimCard");
-    if (!card || card.classList.contains("hidden")) {
-      /* kartu sedang hidden (renderClaim tidak menemukan event) — coba
-         tampilkan lagi kalau sekarang ada event masa depan */
-      var b0 = pickNextClaim(state.data);
-      if (!b0) return;
-      card.classList.remove("hidden");
-    }
     var best = pickNextClaim(state.data);
-    if (!best) return;
+    if (!best) {
+      /* Tidak ada event masa depan (semua sudah lewat / data basi) —
+         sembunyikan kartu, jangan biarkan countdown terakhir yang beku
+         tampil terus. Kartu muncul lagi begitu ada event masa depan. */
+      if (card) card.classList.add("hidden");
+      return;
+    }
+    if (card) card.classList.remove("hidden");
     $("claimAcc").textContent = best.a.l || "—";
     $("claimEv").textContent = best.nx.label || best.a.n || "—";
     $("claimCd").textContent = fmtHMS(best.ms);
@@ -902,7 +929,7 @@
     $("infoAcc").textContent = data.acc.length + " akun";
     $("infoLive").textContent = liveCount + " live · " + (data.acc.length - liveCount) + " offline";
     $("infoTime").textContent = ts ? fmtWIBclean(ts) : "—";
-    $("infoSource").textContent = state.source === "status.json" ? "status.json (live, refresh 30 dtk)" : "snapshot ?s= di URL";
+    $("infoSource").textContent = state.source === "status.json" ? "status.json (live, refresh 10 dtk)" : "snapshot ?s= di URL";
 
     /* TMA form select (rebuild only when account set changes) */
     var labels = data.acc.map(function(a){ return a.l || ""; });
@@ -940,18 +967,28 @@
     }
     try { tg.sendData(JSON.stringify(obj)); }
     catch(e) { showFeedback("Gagal kirim ke bot. Coba buka ulang Console dari bot.", true); return false; }
+    /* sendData itu fire-and-forget (tidak ada ack dari bot), jadi
+       feedback di sini hanya berarti "perintah sudah dikirim", BUKAN
+       "bot sudah menerima". Konfirmasi asli datang lewat pesan bot di
+       chat (mis. "✅ TMA diperbarui"). Jangan pakai kata "Terkirim"
+       yang menyiratkan bot sudah menerima. */
     if (opts.msg) showFeedback(opts.msg, false);
     // JANGAN close() langsung setelah sendData — datanya bisa hilang
     // (WebView keburu ditutup sebelum terkirim). Tunda 600ms + beri
-    // feedback dulu supaya user tahu perintahnya sudah terkirim.
+    // feedback dulu supaya user tahu perintahnya sudah dikirim.
     if (opts.close) {
-      showFeedback("Terkirim — menutup Console…", false);
+      showFeedback("Dikirim — menutup Console…", false);
       setTimeout(function(){ try { tg.close(); } catch(e){} }, 600);
     }
     return true;
   }
   function validTma(t){
-    return t.length >= 30 && (t.indexOf("query_id=") > -1 || t.indexOf("user=") > -1);
+    /* Bot mensyaratkan auth_date= dan hash= — query tanpa itu pasti
+       ditolak. Dulu validTma hanya cek query_id=/user=, jadi query
+       terpotong/tidak lengkap lolos dan user mendapat feedback
+       "Terkirim" padahal bot menolaknya. */
+    return t.length >= 30 && (t.indexOf("query_id=") > -1 || t.indexOf("user=") > -1)
+      && t.indexOf("auth_date=") > -1 && t.indexOf("hash=") > -1;
   }
 
   /* accounts: expand + pause/resume (event delegation) */
@@ -972,6 +1009,13 @@
   });
   $("accounts").addEventListener("keydown", function(e){
     if (e.key !== "Enter" && e.key !== " ") return;
+    /* Tombol pause/resume ada di dalam [data-row]. Kalau tombol itu
+       fokus dan user tekan Enter, handler ini men-toggle expand DAN
+       preventDefault() membatalkan klik native tombol — perintah pause
+       TIDAK terkirim. Kalau tekan Space, baris ke-toggle DAN tombol
+       tetap terkirim (dua aksi). Jadi abaikan keydown di tombol aksi;
+       biar tombol yang menangani Enter/Space-nya sendiri. */
+    if (e.target.closest && e.target.closest("[data-act]")) return;
     var row = e.target.closest ? e.target.closest("[data-row]") : null;
     if (row) { e.preventDefault(); toggleRow(row); }
   });
@@ -1018,7 +1062,7 @@
       err.classList.add("show");
       return;
     }
-    if (sendCmd({ type:"add_account", tma: tma }, { msg:"Terkirim — akun baru akan muncul di daftar sebentar lagi (bot lagi restart)." })) { $("addTmaInput").value = ""; }
+    if (sendCmd({ type:"add_account", tma: tma }, { msg:"Perintah dikirim — bot akan balas di chat kalau akun berhasil ditambah. Cek daftar sebentar lagi." })) { $("addTmaInput").value = ""; }
   });
 
   /* Update TMA */
@@ -1038,7 +1082,7 @@
       err.classList.add("show");
       return;
     }
-    if (sendCmd({ type:"tma_update", account: account, tma: tma }, { msg:"Terkirim — bot lagi restart, akun akan aktif lagi sebentar lagi." })) { $("tmaInput").value = ""; }
+    if (sendCmd({ type:"tma_update", account: account, tma: tma }, { msg:"Perintah dikirim — bot akan balas di chat kalau TMA berhasil diperbarui." })) { $("tmaInput").value = ""; }
   });
 
   /* outside-Telegram notes */
