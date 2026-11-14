@@ -916,7 +916,13 @@
     try { tg.sendData(JSON.stringify(obj)); }
     catch(e) { showFeedback("Gagal kirim ke bot. Coba buka ulang Console dari bot.", true); return false; }
     if (opts.msg) showFeedback(opts.msg, false);
-    if (opts.close) { try { tg.close(); } catch(e){} }
+    // JANGAN close() langsung setelah sendData — datanya bisa hilang
+    // (WebView keburu ditutup sebelum terkirim). Tunda 600ms + beri
+    // feedback dulu supaya user tahu perintahnya sudah terkirim.
+    if (opts.close) {
+      showFeedback("Terkirim — menutup Console…", false);
+      setTimeout(function(){ try { tg.close(); } catch(e){} }, 600);
+    }
     return true;
   }
   function validTma(t){
